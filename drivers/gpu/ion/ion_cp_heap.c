@@ -15,7 +15,7 @@
  *
  */
 #include <linux/spinlock.h>
-
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/genalloc.h>
 #include <linux/io.h>
@@ -28,6 +28,7 @@
 #include <linux/seq_file.h>
 #include <linux/fmem.h>
 #include <linux/iommu.h>
+#include <linux/dma-mapping.h>
 
 #include <asm/mach/map.h>
 
@@ -99,12 +100,38 @@ struct ion_cp_heap {
 	int iommu_2x_map_domain;
 	unsigned int has_outer_cache;
 	atomic_t protect_cnt;
+	void *cpu_addr;
+	size_t heap_size;
+	dma_addr_t handle;
+	int cma;
 };
 
 enum {
 	HEAP_NOT_PROTECTED = 0,
 	HEAP_PROTECTED = 1,
 };
+
+struct ion_cp_buffer {
+	phys_addr_t buffer;
+	atomic_t secure_cnt;
+	int is_secure;
+	int want_delayed_unsecure;
+	/*
+	 * Currently all user/kernel mapping is protected by the heap lock.
+	 * This is sufficient to protect the map count as well. The lock
+	 * should be used to protect map_cnt if the whole heap lock is
+	 * ever removed.
+	 */
+	atomic_t map_cnt;
+	/*
+	 * protects secure_cnt for securing.
+	 */
+	struct mutex lock;
+	int version;
+	void *data;
+};
+
+#define DMA_ALLOC_RETRIES	5
 
 static int ion_cp_protect_mem(unsigned int phy_base, unsigned int size,
 			unsigned int permission_type, int version,
@@ -114,6 +141,71 @@ static int ion_cp_unprotect_mem(unsigned int phy_base, unsigned int size,
 				unsigned int permission_type, int version,
 				void *data);
 
+static int allocate_heap_memory(struct ion_heap *heap)
+{
+	struct device *dev = heap->priv;
+	struct ion_cp_heap *cp_heap =
+		container_of(heap, struct ion_cp_heap, heap);
+	int ret;
+	int tries = 0;
+	DEFINE_DMA_ATTRS(attrs);
+	dma_set_attr(DMA_ATTR_NO_KERNEL_MAPPING, &attrs);
+
+
+	if (cp_heap->cpu_addr)
+		return 0;
+
+	while (!cp_heap->cpu_addr && (++tries < DMA_ALLOC_RETRIES)) {
+		cp_heap->cpu_addr = dma_alloc_attrs(dev,
+						cp_heap->heap_size,
+						&(cp_heap->handle),
+						0,
+						&attrs);
+		if (!cp_heap->cpu_addr)
+			msleep(20);
+	}
+
+	if (!cp_heap->cpu_addr)
+		goto out;
+
+	cp_heap->base = cp_heap->handle;
+
+	cp_heap->pool = gen_pool_create(12, -1);
+	if (!cp_heap->pool)
+		goto out_free;
+
+	ret = gen_pool_add(cp_heap->pool, cp_heap->base,
+				cp_heap->heap_size, -1);
+	if (ret < 0)
+		goto out_pool;
+
+	return 0;
+
+out_pool:
+	gen_pool_destroy(cp_heap->pool);
+out_free:
+	dma_free_coherent(dev, cp_heap->heap_size, cp_heap->cpu_addr,
+				cp_heap->handle);
+out:
+	return ION_CP_ALLOCATE_FAIL;
+}
+
+static void free_heap_memory(struct ion_heap *heap)
+{
+	struct device *dev = heap->priv;
+	struct ion_cp_heap *cp_heap =
+		container_of(heap, struct ion_cp_heap, heap);
+
+	/* release memory */
+	dma_free_coherent(dev, cp_heap->heap_size, cp_heap->cpu_addr,
+				cp_heap->handle);
+	gen_pool_destroy(cp_heap->pool);
+	cp_heap->pool = NULL;
+	cp_heap->cpu_addr = 0;
+}
+
+
+
 /**
  * Get the total number of kernel mappings.
  * Must be called with heap->lock locked.
@@ -122,6 +214,179 @@ static unsigned long ion_cp_get_total_kmap_count(
 					const struct ion_cp_heap *cp_heap)
 {
 	return cp_heap->kmap_cached_count + cp_heap->kmap_uncached_count;
+}
+
+static int ion_on_first_alloc(struct ion_heap *heap)
+{
+	struct ion_cp_heap *cp_heap =
+		container_of(heap, struct ion_cp_heap, heap);
+	int ret_value;
+
+	if (cp_heap->reusable) {
+		ret_value = fmem_set_state(FMEM_C_STATE);
+		if (ret_value)
+			return 1;
+	}
+
+	if (cp_heap->cma) {
+		ret_value = allocate_heap_memory(heap);
+		if (ret_value)
+			return 1;
+	}
+	return 0;
+}
+
+static void ion_on_last_free(struct ion_heap *heap)
+{
+	struct ion_cp_heap *cp_heap =
+		container_of(heap, struct ion_cp_heap, heap);
+
+	if (cp_heap->reusable)
+		if (fmem_set_state(FMEM_T_STATE) != 0)
+			pr_err("%s: unable to transition heap to T-state\n",
+				__func__);
+
+	if (cp_heap->cma)
+		free_heap_memory(heap);
+}
+
+/* Must be protected by ion_cp_buffer lock */
+static int __ion_cp_protect_buffer(struct ion_buffer *buffer, int version,
+					void *data, int flags)
+{
+	struct ion_cp_buffer *buf = buffer->priv_virt;
+	int ret_value = 0;
+
+	if (atomic_inc_return(&buf->secure_cnt) == 1) {
+		ret_value = ion_cp_protect_mem(buf->buffer,
+				buffer->size, 0,
+				version, data);
+
+		if (ret_value) {
+			pr_err("Failed to secure buffer %p, error %d\n",
+				buffer, ret_value);
+			atomic_dec(&buf->secure_cnt);
+		} else {
+			pr_debug("Protected buffer %p from %x-%x\n",
+				buffer, buf->buffer,
+				buf->buffer + buffer->size);
+			buf->want_delayed_unsecure |=
+				flags & ION_UNSECURE_DELAYED ? 1 : 0;
+			buf->data = data;
+			buf->version = version;
+		}
+	}
+	pr_debug("buffer %p protect count %d\n", buffer,
+		atomic_read(&buf->secure_cnt));
+	BUG_ON(atomic_read(&buf->secure_cnt) < 0);
+	return ret_value;
+}
+
+/* Must be protected by ion_cp_buffer lock */
+static int __ion_cp_unprotect_buffer(struct ion_buffer *buffer, int version,
+					void *data, int force_unsecure)
+{
+	struct ion_cp_buffer *buf = buffer->priv_virt;
+	int ret_value = 0;
+
+	if (force_unsecure) {
+		if (!buf->is_secure || atomic_read(&buf->secure_cnt) == 0)
+			return 0;
+
+		if (atomic_read(&buf->secure_cnt) != 1) {
+			WARN(1, "Forcing unsecure of buffer with outstanding secure count %d!\n",
+				atomic_read(&buf->secure_cnt));
+			atomic_set(&buf->secure_cnt, 1);
+		}
+	}
+
+	if (atomic_dec_and_test(&buf->secure_cnt)) {
+		ret_value = ion_cp_unprotect_mem(
+			buf->buffer, buffer->size,
+			0, version, data);
+
+		if (ret_value) {
+			pr_err("Failed to unsecure buffer %p, error %d\n",
+				buffer, ret_value);
+			/*
+			 * If the force unsecure is happening, the buffer
+			 * is being destroyed. We failed to unsecure the
+			 * buffer even though the memory is given back.
+			 * Just die now rather than discovering later what
+			 * happens when trying to use the secured memory as
+			 * unsecured...
+			 */
+			BUG_ON(force_unsecure);
+			/* Bump the count back up one to try again later */
+			atomic_inc(&buf->secure_cnt);
+		} else {
+			buf->version = -1;
+			buf->data = NULL;
+		}
+	}
+	pr_debug("buffer %p unprotect count %d\n", buffer,
+		atomic_read(&buf->secure_cnt));
+	BUG_ON(atomic_read(&buf->secure_cnt) < 0);
+	return ret_value;
+}
+
+int ion_cp_secure_buffer(struct ion_buffer *buffer, int version, void *data,
+				int flags)
+{
+	int ret_value;
+	struct ion_cp_buffer *buf = buffer->priv_virt;
+
+	mutex_lock(&buf->lock);
+	if (!buf->is_secure) {
+		pr_err("%s: buffer %p was not allocated as secure\n",
+			__func__, buffer);
+		ret_value = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (ION_IS_CACHED(buffer->flags)) {
+		pr_err("%s: buffer %p was allocated as cached\n",
+			__func__, buffer);
+		ret_value = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (atomic_read(&buf->map_cnt)) {
+		pr_err("%s: cannot secure buffer %p with outstanding mappings. Total count: %d",
+			__func__, buffer, atomic_read(&buf->map_cnt));
+		ret_value = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (atomic_read(&buf->secure_cnt)) {
+		if (buf->version != version || buf->data != data) {
+			pr_err("%s: Trying to re-secure buffer with different values",
+				__func__);
+			pr_err("Last secured version: %d Currrent %d\n",
+				buf->version, version);
+			pr_err("Last secured data: %p current %p\n",
+				buf->data, data);
+			ret_value = -EINVAL;
+			goto out_unlock;
+		}
+	}
+	ret_value = __ion_cp_protect_buffer(buffer, version, data, flags);
+
+out_unlock:
+	mutex_unlock(&buf->lock);
+	return ret_value;
+}
+
+int ion_cp_unsecure_buffer(struct ion_buffer *buffer, int force_unsecure)
+{
+	int ret_value = 0;
+	struct ion_cp_buffer *buf = buffer->priv_virt;
+
+	mutex_lock(&buf->lock);
+	ret_value = __ion_cp_unprotect_buffer(buffer, buf->version, buf->data,
+						force_unsecure);
+	mutex_unlock(&buf->lock);
+	return ret_value;
 }
 
 /**
@@ -469,7 +734,24 @@ void *ion_cp_heap_map_kernel(struct ion_heap *heap, struct ion_buffer *buffer)
 		if (cp_heap->reusable) {
 			ret_value = ion_map_fmem_buffer(buffer, cp_heap->base,
 				cp_heap->reserved_vrange, buffer->flags);
+		} else if (cp_heap->cma) {
+			int npages = PAGE_ALIGN(buffer->size) / PAGE_SIZE;
+			struct page **pages = vmalloc(
+						sizeof(struct page *) * npages);
+			int i;
+			pgprot_t pgprot;
 
+			if (ION_IS_CACHED(buffer->flags))
+				pgprot = PAGE_KERNEL;
+			else
+				pgprot = pgprot_writecombine(PAGE_KERNEL);
+
+			for (i = 0; i < npages; i++) {
+				pages[i] = phys_to_page(buffer->priv_phys +
+						i * PAGE_SIZE);
+			}
+			ret_value = vmap(pages, npages, VM_IOREMAP, pgprot);
+			vfree(pages);
 		} else {
 			if (ION_IS_CACHED(buffer->flags))
 				ret_value = ioremap_cached(buffer->priv_phys,
@@ -500,6 +782,8 @@ void ion_cp_heap_unmap_kernel(struct ion_heap *heap,
 
 	if (cp_heap->reusable)
 		unmap_kernel_range((unsigned long)buffer->vaddr, buffer->size);
+	else if (cp_heap->cma)
+		vunmap(buffer->vaddr);
 	else
 		__arm_iounmap(buffer->vaddr);
 
@@ -915,14 +1199,6 @@ struct ion_heap *ion_cp_heap_create(struct ion_platform_heap *heap_data)
 
 	mutex_init(&cp_heap->lock);
 
-	cp_heap->pool = gen_pool_create(12, -1);
-	if (!cp_heap->pool)
-		goto free_heap;
-
-	cp_heap->base = heap_data->base;
-	ret = gen_pool_add(cp_heap->pool, cp_heap->base, heap_data->size, -1);
-	if (ret < 0)
-		goto destroy_pool;
 
 	cp_heap->allocated_bytes = 0;
 	cp_heap->umap_count = 0;
@@ -932,9 +1208,11 @@ struct ion_heap *ion_cp_heap_create(struct ion_platform_heap *heap_data)
 	cp_heap->heap.ops = &cp_heap_ops;
 	cp_heap->heap.type = ION_HEAP_TYPE_CP;
 	cp_heap->heap_protected = HEAP_NOT_PROTECTED;
-	cp_heap->secure_base = cp_heap->base;
+	cp_heap->secure_base = heap_data->base;
 	cp_heap->secure_size = heap_data->size;
 	cp_heap->has_outer_cache = heap_data->has_outer_cache;
+	cp_heap->heap_size = heap_data->size;
+
 	atomic_set(&cp_heap->protect_cnt, 0);
 	if (heap_data->extra_data) {
 		struct ion_cp_heap_pdata *extra_data =
@@ -956,9 +1234,26 @@ struct ion_heap *ion_cp_heap_create(struct ion_platform_heap *heap_data)
 				extra_data->iommu_map_all;
 		cp_heap->iommu_2x_map_domain =
 				extra_data->iommu_2x_map_domain;
+		cp_heap->cma = extra_data->is_cma;
 
 	}
 
+	if (cp_heap->cma) {
+		cp_heap->pool = NULL;
+		cp_heap->cpu_addr = 0;
+		cp_heap->heap.priv = heap_data->priv;
+	} else {
+		cp_heap->pool = gen_pool_create(12, -1);
+		if (!cp_heap->pool)
+			goto free_heap;
+
+		cp_heap->base = heap_data->base;
+		ret = gen_pool_add(cp_heap->pool, cp_heap->base,
+					heap_data->size, -1);
+		if (ret < 0)
+			goto destroy_pool;
+
+	}
 	return &cp_heap->heap;
 
 destroy_pool:
