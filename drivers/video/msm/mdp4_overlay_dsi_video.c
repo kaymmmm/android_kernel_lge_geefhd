@@ -741,15 +741,7 @@ int mdp4_dsi_video_on(struct platform_device *pdev)
 	mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
 
 	mdp_histogram_ctrl_all(TRUE);
-
-#if defined(CONFIG_FB_MSM_MIPI_LGIT_VIDEO_WXGA_PT) \
-    || defined(CONFIG_FB_MSM_MIPI_LGIT_VIDEO_FHD_INVERSE_PT) \
-    || defined(CONFIG_FB_MSM_MIPI_LGIT_VIDEO_FHD_INVERSE_PT_PANEL)
-//    mdp4_overlay_dsi_video_start();//remove set other position in this file
-#else
-    mdp4_overlay_dsi_video_start();
-#endif
-
+	mdp4_overlay_dsi_video_start();
 	return ret;
 }
 
