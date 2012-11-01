@@ -510,22 +510,23 @@ _kgsl_sharedmem_page_alloc(struct kgsl_memdesc *memdesc,
 	struct page **pages = NULL;
 	pgprot_t page_prot = pgprot_writecombine(PAGE_KERNEL);
 	void *ptr;
-	struct sysinfo si;
+
+	unsigned int align;
+
+	align = (memdesc->flags & KGSL_MEMALIGN_MASK) >> KGSL_MEMALIGN_SHIFT;
+
+	page_size = (align >= ilog2(SZ_64K) && size >= SZ_64K)
+			? SZ_64K : PAGE_SIZE;
+	/* update align flags for what we actually use */
+	if (page_size != PAGE_SIZE)
+		kgsl_memdesc_set_align(memdesc, ilog2(page_size));
 
 	/*
-	 * Get the current memory information to be used in deciding if we
-	 * should go ahead with this allocation
+	 * There needs to be enough room in the sg structure to be able to
+	 * service the allocation entirely with PAGE_SIZE sized chunks
 	 */
 
-	si_meminfo(&si);
-
-	/*
-	 * Don't let the user allocate more free memory then is available on the
-	 * system
-	 */
-
-	if (size >= (si.freeram << PAGE_SHIFT))
-		return -ENOMEM;
+	sglen_alloc = PAGE_ALIGN(size) >> PAGE_SHIFT;
 
 	/*
 	 * Add guard page to the end of the allocation when the
@@ -567,8 +568,20 @@ _kgsl_sharedmem_page_alloc(struct kgsl_memdesc *memdesc,
 
 	kmemleak_not_leak(memdesc->sg);
 
-	memdesc->sglen = sglen;
-	sg_init_table(memdesc->sg, sglen);
+	memdesc->sglen_alloc = sglen_alloc;
+	sg_init_table(memdesc->sg, sglen_alloc);
+
+	len = size;
+
+	while (len > 0) {
+		struct page *page;
+		unsigned int gfp_mask = GFP_KERNEL | __GFP_HIGHMEM |
+			__GFP_NOWARN | __GFP_NORETRY;
+		int j;
+
+		/* don't waste space at the end of the allocation*/
+		if (len < page_size)
+			page_size = PAGE_SIZE;
 
 	for (i = 0; i < PAGE_ALIGN(size) / PAGE_SIZE; i++) {
 
@@ -577,11 +590,18 @@ _kgsl_sharedmem_page_alloc(struct kgsl_memdesc *memdesc,
 		 * range ourselves (see below)
 		 */
 
-		pages[i] = alloc_page(GFP_KERNEL | __GFP_HIGHMEM |
-			__GFP_NOWARN | __GFP_NORETRY);
-		if (pages[i] == NULL) {
+
+		if (page == NULL) {
+			if (page_size != PAGE_SIZE) {
+				page_size = PAGE_SIZE;
+				continue;
+			}
+
+			KGSL_CORE_ERR(
+				"Out of memory: only allocated %dKB of %dKB requested\n",
+				(size - len) >> 10, size >> 10);
+
 			ret = -ENOMEM;
-			memdesc->sglen = i;
 			goto done;
 		}
 
