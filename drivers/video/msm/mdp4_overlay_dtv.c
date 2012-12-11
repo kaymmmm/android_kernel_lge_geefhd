@@ -614,16 +614,11 @@ int mdp4_dtv_off(struct platform_device *pdev)
 
 	atomic_set(&vctrl->suspend, 1);
 	atomic_set(&vctrl->vsync_resume, 0);
-	//QCT_PATCH_S
+
 	/* wait for one vsycn time to make sure
 	 * previous stage_commit had been kicked in
 	 */
 	msleep(20);     /* >= 17 ms */
-	//QCT_PATCH_E
-	if (vctrl->wait_vsync_cnt) {
-		complete_all(&vctrl->vsync_comp);
-		vctrl->wait_vsync_cnt = 0;
-	}
 
 	pipe = vctrl->base_pipe;
 	if (pipe != NULL) {
