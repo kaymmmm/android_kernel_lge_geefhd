@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2012, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -347,14 +347,6 @@ void mdp4_dsi_video_wait4vsync(int cndx)
 	if (atomic_read(&vctrl->suspend) > 0)
 		return;
 
-#if defined(CONFIG_FB_MSM_MIPI_LGIT_VIDEO_WXGA_PT) || defined(CONFIG_FB_MSM_MIPI_HITACHI_VIDEO_HD_PT)
-	/* start timing generator & mmu if they are not started yet */
-	mdp4_overlay_dsi_video_start();
-#elif defined(CONFIG_FB_MSM_MIPI_LGIT_VIDEO_FHD_INVERSE_PT) \
-       || defined(CONFIG_FB_MSM_MIPI_LGIT_VIDEO_FHD_INVERSE_PT_PANEL)
-//	mdp4_overlay_dsi_video_start();
-#endif
-
 	mdp4_video_vsync_irq_ctrl(cndx, 1);
 
 	spin_lock_irqsave(&vctrl->spin_lock, flags);
@@ -619,7 +611,7 @@ int mdp4_dsi_video_on(struct platform_device *pdev)
 
 		mfd->cont_splash_done = 1;
 		MDP_OUTP(MDP_BASE + DSI_VIDEO_BASE, 0);
-		mdp4_dsi_video_wait4vsync(0, &vtime);
+		mdp4_dsi_video_wait4vsync(0);
 		mipi_dsi_controller_cfg(0);
 	}
 
