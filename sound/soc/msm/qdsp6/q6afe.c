@@ -1731,11 +1731,8 @@ int afe_close(int port_id)
 		if (!(pcm_afe_instance[port_id & 0x1] == 0 &&
 			proxy_afe_instance[port_id & 0x1] == 0))
 			return 0;
-<<<<<<< HEAD
 		else
 			afe_close_done[port_id & 0x1] = true;
-=======
->>>>>>> d14521d... ASoC: msm: Fix delay in switching from WFD session
 	}
 
 	if ((port_id == RT_PROXY_DAI_002_RX) ||
@@ -1747,11 +1744,8 @@ int afe_close(int port_id)
 		if (!(pcm_afe_instance[port_id & 0x1] == 0 &&
 			proxy_afe_instance[port_id & 0x1] == 0))
 			return 0;
-<<<<<<< HEAD
 		else
 			afe_close_done[port_id & 0x1] = true;
-=======
->>>>>>> d14521d... ASoC: msm: Fix delay in switching from WFD session
 	}
 
 	port_id = afe_convert_virtual_to_portid(port_id);
