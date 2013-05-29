@@ -2342,6 +2342,143 @@ static struct vm_operations_struct kgsl_gpumem_vm_ops = {
 	.close = kgsl_gpumem_vm_close,
 };
 
+static int
+get_mmap_entry(struct kgsl_process_private *private,
+		struct kgsl_mem_entry **out_entry, unsigned long pgoff,
+		unsigned long len)
+{
+	int ret = -EINVAL;
+	struct kgsl_mem_entry *entry;
+
+	entry = kgsl_sharedmem_find_id(private, pgoff);
+	if (entry == NULL) {
+		spin_lock(&private->mem_lock);
+		entry = kgsl_sharedmem_find(private, pgoff << PAGE_SHIFT);
+		spin_unlock(&private->mem_lock);
+	}
+
+	if (!entry)
+		return -EINVAL;
+
+	kgsl_mem_entry_get(entry);
+
+	if (!entry->memdesc.ops ||
+		!entry->memdesc.ops->vmflags ||
+		!entry->memdesc.ops->vmfault) {
+		ret = -EINVAL;
+		goto err_put;
+	}
+
+	if (entry->memdesc.useraddr != 0) {
+		ret = -EBUSY;
+		goto err_put;
+	}
+
+	if (len != kgsl_memdesc_mmapsize(&entry->memdesc)) {
+		ret = -ERANGE;
+		goto err_put;
+	}
+
+	*out_entry = entry;
+	return 0;
+err_put:
+	kgsl_mem_entry_put(entry);
+	return ret;
+}
+
+static unsigned long
+kgsl_get_unmapped_area(struct file *file, unsigned long addr,
+			unsigned long len, unsigned long pgoff,
+			unsigned long flags)
+{
+	unsigned long ret = 0;
+	unsigned long vma_offset = pgoff << PAGE_SHIFT;
+	struct kgsl_device_private *dev_priv = file->private_data;
+	struct kgsl_process_private *private = dev_priv->process_priv;
+	struct kgsl_device *device = dev_priv->device;
+	struct kgsl_mem_entry *entry = NULL;
+	unsigned int align;
+	unsigned int retry = 0;
+
+	if (vma_offset == device->memstore.gpuaddr)
+		return get_unmapped_area(NULL, addr, len, pgoff, flags);
+
+	ret = get_mmap_entry(private, &entry, pgoff, len);
+	if (ret)
+		return ret;
+
+	if (!kgsl_memdesc_use_cpu_map(&entry->memdesc) || (flags & MAP_FIXED)) {
+		/*
+		 * If we're not going to use the same mapping on the gpu,
+		 * any address is fine.
+		 * For MAP_FIXED, hopefully the caller knows what they're doing,
+		 * but we may fail in mmap() if there is already something
+		 * at the virtual address chosen.
+		 */
+		ret = get_unmapped_area(NULL, addr, len, pgoff, flags);
+		goto put;
+	}
+	if (entry->memdesc.gpuaddr != 0) {
+		KGSL_MEM_INFO(device,
+				"pgoff %lx already mapped to gpuaddr %x\n",
+				pgoff, entry->memdesc.gpuaddr);
+		ret = -EBUSY;
+		goto put;
+	}
+
+	align = kgsl_memdesc_get_align(&entry->memdesc);
+	if (align >= ilog2(SZ_1M))
+		align = ilog2(SZ_1M);
+	else if (align >= ilog2(SZ_64K))
+		align = ilog2(SZ_64K);
+	else if (align <= PAGE_SHIFT)
+		align = 0;
+
+	if (align)
+		len += 1 << align;
+	do {
+		ret = get_unmapped_area(NULL, addr, len, pgoff, flags);
+		if (IS_ERR_VALUE(ret))
+			break;
+		if (align)
+			ret = ALIGN(ret, (1 << align));
+
+		/*make sure there isn't a GPU only mapping at this address */
+		if (kgsl_sharedmem_region_empty(private, ret, orig_len))
+			break;
+
+		trace_kgsl_mem_unmapped_area_collision(entry, addr, orig_len,
+							ret);
+
+		/*
+		 * If we collided, bump the hint address so that
+		 * get_umapped_area knows to look somewhere else.
+		 */
+		addr = (addr == 0) ? ret + orig_len : addr + orig_len;
+
+		/*
+		 * The addr hint can be set by userspace to be near
+		 * the end of the address space. Make sure we search
+		 * the whole address space at least once by wrapping
+		 * back around once.
+		 */
+		if (!retry && (addr + len >= TASK_SIZE)) {
+			addr = 0;
+			retry = 1;
+		} else {
+			ret = -EBUSY;
+		}
+	} while (addr + len < TASK_SIZE);
+
+	if (IS_ERR_VALUE(ret))
+		KGSL_MEM_INFO(device,
+				"pid %d pgoff %lx len %ld failed error %ld\n",
+				private->pid, pgoff, len, ret);
+put:
+	kgsl_mem_entry_put(entry);
+	return ret;
+}
+
 static int kgsl_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	unsigned long vma_offset = vma->vm_pgoff << PAGE_SHIFT;
