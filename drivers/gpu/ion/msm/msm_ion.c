@@ -19,6 +19,11 @@
 #include <linux/memory_alloc.h>
 #include <linux/fmem.h>
 #include <linux/of.h>
+#include <linux/mm.h>
+#include <linux/mm_types.h>
+#include <linux/sched.h>
+#include <linux/rwsem.h>
+#include <linux/uaccess.h>
 #include <mach/ion.h>
 #include <mach/msm_memtypes.h>
 #include "../ion_priv.h"
