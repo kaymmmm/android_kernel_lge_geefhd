@@ -10,7 +10,8 @@ OBJS		=
 # to minimise that number of bocks that have to be read in
 # order to load it.
 ifeq ($(CONFIG_ZBOOT_ROM_MMCIF),y)
-OBJS		+= mmcif-sh7372.o
+ifeq ($(CONFIG_ARCH_SH7372),y)
+OBJS            += mmcif-sh7372.o
 endif
 
 # Ensure that SDHI loader code appears early in the image
@@ -20,12 +21,24 @@ ifeq ($(CONFIG_ZBOOT_ROM_SH_MOBILE_SDHI),y)
 OBJS		+= sdhi-shmobile.o
 OBJS		+= sdhi-sh7372.o
 endif
-
-AFLAGS_head.o += -DTEXT_OFFSET=$(TEXT_OFFSET)
-HEAD	= head.o
-OBJS	+= misc.o decompress.o
-FONTC	= $(srctree)/drivers/video/console/font_acorn_8x8.c
-
+ 
+AFLAGS_head.o := -DTEXT_OFFSET=$(TEXT_OFFSET)
+AFLAGS_head.o += -Wa,-march=armv7-a$(plus_sec)
+HEAD = head.o
+ 
+AFLAGS_misc.o +=-Wa,-march=armv7-a$(plus_sec)
+MISC = misc.o
+ 
+AFLAGS_decompress.o += -Wa,-march=armv7-a$(plus_sec)
+DECOMPRESS = decompress.o
+ 
+FONTC   = $(srctree)/drivers/video/console/font_acorn_8x8.c
+ 
+#AFLAGS_head.o += -DTEXT_OFFSET=$(TEXT_OFFSET)
+#HEAD   = head.o
+#OBJS   += misc.o decompress.o
+#FONTC  = $(srctree)/drivers/video/console/font_acorn_8x8.c
+ 
 # string library code (-Os is enforced to keep it much smaller)
 OBJS		+= string.o
 CFLAGS_string.o	:= -Os
@@ -129,8 +142,8 @@ ccflags-y := -fpic -fno-builtin -I$(obj)
 asflags-y := -Wa,-march=all
 
 # Supply kernel BSS size to the decompressor via a linker symbol.
-KBSS_SZ = $(shell $(CROSS_COMPILE)size $(obj)/../../../../vmlinux | \
-		awk 'END{print $$3}')
+SIZEBIN := $(if $(shell which $(CROSS_COMPILE)size),$(CROSS_COMPILE)size,size)
+KBSS_SZ = $(shell $(SIZEBIN) $(obj)/../../../../vmlinux | awk 'END{print $$3}')
 LDFLAGS_vmlinux = --defsym _kernel_bss_size=$(KBSS_SZ)
 # Supply ZRELADDR to the decompressor via a linker symbol.
 ifneq ($(CONFIG_AUTO_ZRELADDR),y)
@@ -138,6 +151,9 @@ LDFLAGS_vmlinux += --defsym zreladdr=$(ZRELADDR)
 endif
 ifeq ($(CONFIG_CPU_ENDIAN_BE8),y)
 LDFLAGS_vmlinux += --be8
+endif
+ifneq ($(PARAMS_PHYS),)
+LDFLAGS_vmlinux += --defsym params_phys=$(PARAMS_PHYS)
 endif
 # ?
 LDFLAGS_vmlinux += -p
@@ -149,6 +165,7 @@ LDFLAGS_vmlinux += -X
 LDFLAGS_vmlinux += -T
 
 # For __aeabi_uidivmod
+AFLAGS_lib1funcs.o +=-Wa,-march=armv7-a$(plus_sec)
 lib1funcs = $(obj)/lib1funcs.o
 
 $(obj)/lib1funcs.S: $(srctree)/arch/$(SRCARCH)/lib/lib1funcs.S
@@ -185,7 +202,7 @@ $(obj)/vmlinux: $(obj)/vmlinux.lds $(obj)/$(HEAD) $(obj)/piggy.$(suffix_y).o \
 	@$(check_for_multiple_zreladdr)
 	$(call if_changed,ld)
 	@$(check_for_bad_syms)
-
+AFLAGS_piggy.$(suffix_y).o += -Wa,-march=armv7-a$(plus_sec)
 $(obj)/piggy.$(suffix_y): $(obj)/../Image FORCE
 	$(call if_changed,$(suffix_y))
 
